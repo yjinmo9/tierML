@@ -1,0 +1,14 @@
+{
+  "roc_auc": 0.742678111326249,
+  "average_precision": 0.37806801918182326,
+  "params": {
+    "n_estimators": 308,
+    "max_depth": 12,
+    "num_leaves": 53,
+    "learning_rate": 0.018283687041932208,
+    "min_data_in_leaf": 19,
+    "feature_fraction": 0.692148353875,
+    "bagging_fraction": 0.6044136819399031,
+    "bagging_freq": 4
+  }
+}
