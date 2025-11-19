@@ -1,0 +1,5 @@
+- Train shape: (720, 799)
+- Test shape: (466, 799)
+- Target imbalance (mean): 0.1486
+- Proc params: 11 columns
+- x/y/p 각 256개 여부: [256, 256, 256]
