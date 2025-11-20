@@ -13,7 +13,11 @@ from .logging_utils import setup_logger
 from .model_inference import run_inference
 from .model_training import run_model_training
 from .preprocessing import run_preprocessing
-from .tree_model_training import compare_tree_models, run_tree_model_training
+from .feature_ablation_study import run_feature_ablation_study
+from .cnn_sequence_model import run_cnn_sequence_experiment, tune_cnn_hyperparameters
+from .transformer_sequence_model import run_transformer_sequence_experiment
+from .threshold_analysis import run_threshold_analysis
+from .tree_model_training import compare_tree_models, run_tree_inference, run_tree_model_training
 from .tree_hyperparameter_tuning import tune_all_models, tune_catboost, tune_lgbm, tune_xgb
 
 
@@ -78,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
             "train_tree",
             "compare_trees",
             "tune_tree",
+            "feature_ablation",
+            "threshold_analysis",
+            "cnn_sequence",
+            "tune_cnn",
+            "transformer_sequence",
             "infer",
             "calibrate",
             "ensemble",
@@ -96,6 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="하이퍼파라미터 튜닝 시도 횟수 (tune_tree step에서 사용)",
+    )
+    parser.add_argument(
+        "--feature-type",
+        type=str,
+        choices=["A", "B", "C", "D"],
+        default="C",
+        help="피처 타입 선택 (threshold_analysis step에서 사용)",
     )
     return parser
 
@@ -127,6 +143,17 @@ def main() -> None:
         run_tree_model_training(config, model_name=args.tree_model)
     elif step == "compare_trees":
         compare_tree_models(config)
+    elif step == "feature_ablation":
+        run_feature_ablation_study(config)
+    elif step == "threshold_analysis":
+        run_threshold_analysis(config, feature_type=args.feature_type if hasattr(args, "feature_type") else "C")
+    elif step == "cnn_sequence":
+        run_cnn_sequence_experiment(config)
+    elif step == "tune_cnn":
+        n_trials = getattr(args, "n_trials", 20)
+        tune_cnn_hyperparameters(config, n_trials=n_trials)
+    elif step == "transformer_sequence":
+        run_transformer_sequence_experiment(config)
     elif step == "tune_tree":
         if args.tree_model == "all":
             tune_all_models(config, n_trials=args.n_trials)
@@ -137,7 +164,10 @@ def main() -> None:
         elif args.tree_model == "catboost":
             tune_catboost(config, n_trials=args.n_trials)
     elif step == "infer":
-        run_inference(config)
+        if config.model_type == "tree":
+            run_tree_inference(config, model_name=args.tree_model, use_tuned=True)
+        else:
+            run_inference(config)
     elif step == "calibrate":
         run_calibration(config)
     elif step == "ensemble":

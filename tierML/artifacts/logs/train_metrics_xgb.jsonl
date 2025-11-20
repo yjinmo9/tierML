@@ -1,1 +1,1 @@
-{"roc_auc": 0.7326157552103184, "average_precision": 0.3370379627685544, "model": "xgb"}
+{"roc_auc": 0.6925340366818619, "average_precision": 0.2938908750208959, "model": "xgb"}

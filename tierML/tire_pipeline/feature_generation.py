@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -14,6 +15,84 @@ from .logging_utils import log_time, setup_logger
 
 logger = setup_logger(__name__)
 
+ENABLE_SIZE_RISK = os.getenv("ENABLE_SIZE_RISK_SCORE", "0").lower() in {"1", "true", "yes"}
+ENABLE_MASS_SIZE_INTERACTION = os.getenv("ENABLE_MASS_SIZE_INTERACTION", "0").lower() in {"1", "true", "yes"}
+ENABLE_PLANT_RISK = os.getenv("ENABLE_PLANT_RISK_FEATURES", "0").lower() in {"1", "true", "yes"}
+ENABLE_PILOT_PARAM_ZSCORE = os.getenv("ENABLE_PILOT_PARAM_ZSCORE", "0").lower() in {"1", "true", "yes"}
+PILOT_ZSCORE_TOPK = int(os.getenv("PILOT_ZSCORE_TOPK", "5"))
+ENABLE_SEQ_GRAD = os.getenv("ENABLE_SEQ_GRAD_FEATURES", "0").lower() in {"1", "true", "yes"}
+
+
+def _compute_outlier_flags(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+    flag_arrays = []
+    for col in cols:
+        series = df[col]
+        if series.dropna().empty:
+            continue
+        q1 = series.quantile(0.25)
+        q3 = series.quantile(0.75)
+        iqr = q3 - q1
+        if np.isclose(iqr, 0):
+            continue
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        flag_arrays.append(((series < lower) | (series > upper)).astype(int))
+    if not flag_arrays:
+        return pd.DataFrame(index=df.index)
+    return pd.concat(flag_arrays, axis=1).fillna(0).astype(int)
+
+
+def _compute_plant_outlier_rate(
+    df: pd.DataFrame,
+    plant_col: str,
+    numeric_cols: Iterable[str],
+) -> dict | None:
+    if plant_col not in df.columns or not numeric_cols:
+        return None
+    flag_df = _compute_outlier_flags(df, numeric_cols)
+    if flag_df.empty:
+        return None
+    row_flag = flag_df.sum(axis=1) > 0
+    rates = row_flag.groupby(df[plant_col]).mean()
+    overall = float(row_flag.mean())
+    return {"rates": rates, "overall": overall}
+
+
+def _normalize_series(series: pd.Series) -> pd.Series:
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+    min_val = series.min()
+    max_val = series.max()
+    denom = max_val - min_val
+    if np.isclose(denom, 0):
+        return pd.Series(0.0, index=series.index)
+    return (series - min_val) / denom
+
+
+def _compute_pilot_param_stats(
+    df: pd.DataFrame,
+    pilot_col: str,
+    param_cols: list[str],
+    topk: int,
+) -> dict | None:
+    if pilot_col not in df.columns or not param_cols:
+        return None
+    std_series = df[param_cols].std().sort_values(ascending=False)
+    selected_cols = std_series.head(topk).index.tolist()
+    if not selected_cols:
+        return None
+    pilot_groups = df.groupby(pilot_col)
+    stats: dict[str, dict[str, dict[str, float]]] = {}
+    for col in selected_cols:
+        group_mean = pilot_groups[col].mean()
+        group_std = pilot_groups[col].std().replace(0, np.nan)
+        stats[col] = {
+            "mean": group_mean.to_dict(),
+            "std": group_std.to_dict(),
+            "global_mean": float(df[col].mean()),
+            "global_std": float(df[col].std() or 1.0),
+        }
+    return stats
 
 def _prefixed_columns(df: pd.DataFrame, prefix: str) -> List[str]:
     return sorted(
@@ -72,9 +151,31 @@ def _assign_bins(series: pd.Series, edges: np.ndarray) -> pd.Series:
 
 def _build_feature_context(train_df: pd.DataFrame, config: PipelineConfig) -> Dict[str, Dict]:
     context: Dict[str, Dict] = {}
+    target_binary = None
+    if config.target_column in train_df.columns:
+        target_binary = (train_df[config.target_column] != "Good").astype(float)
+
+    size_risk_info: Dict[str, Dict[str, object]] = {}
+
     for col in ("Width", "Aspect", "Inch"):
         if col in train_df.columns:
             context[f"{col.lower()}_edges"] = _compute_bin_edges(train_df[col], n_bins=5)
+            if ENABLE_SIZE_RISK and target_binary is not None:
+                bins = _assign_bins(train_df[col], context[f"{col.lower()}_edges"])
+                rates = target_binary.groupby(bins).mean()
+                overall = target_binary.mean()
+                risk_bins = [
+                    int(bin_value)
+                    for bin_value, rate in rates.items()
+                    if pd.notna(bin_value) and rate >= overall
+                ]
+                size_risk_info[col] = {
+                    "risk_bins": risk_bins,
+                    "rates": rates.to_dict(),
+                    "threshold": float(overall),
+                }
+    if ENABLE_SIZE_RISK and size_risk_info:
+        context["size_risk_info"] = size_risk_info
     proc_cols = [
         col
         for col in train_df.columns
@@ -91,6 +192,43 @@ def _build_feature_context(train_df: pd.DataFrame, config: PipelineConfig) -> Di
             target_binary = (train_df[config.target_column] != "Good").astype(float)
             context["plant_ng_rate"] = target_binary.groupby(train_df["Plant"]).mean()
             context["overall_ng_rate"] = target_binary.mean()
+        if ENABLE_PLANT_RISK:
+            outlier_info = _compute_plant_outlier_rate(train_df, "Plant", proc_cols)
+            if outlier_info is not None:
+                context["plant_outlier_rate_map"] = outlier_info
+
+    if ENABLE_PLANT_RISK and "Plant" in train_df.columns:
+        risk_components = []
+        ng_series = context.get("plant_ng_rate")
+        if ng_series is not None and not ng_series.empty:
+            risk_components.append(_normalize_series(ng_series))
+        std_series = context.get("plant_proc_std_mean")
+        if std_series is not None and not std_series.empty:
+            risk_components.append(_normalize_series(std_series))
+        outlier_map = context.get("plant_outlier_rate_map")
+        if outlier_map is not None:
+            rates = outlier_map["rates"]
+            if rates is not None and not rates.empty:
+                risk_components.append(_normalize_series(rates))
+        if risk_components:
+            risk_df = pd.concat(risk_components, axis=1).fillna(0)
+            risk_score = risk_df.mean(axis=1)
+            thresholds = risk_score.quantile([0.33, 0.66]).tolist()
+            context["plant_risk"] = {
+                "score": risk_score.to_dict(),
+                "default_score": float(risk_score.mean()),
+                "quality_thresholds": thresholds,
+            }
+    if ENABLE_PILOT_PARAM_ZSCORE and "Mass_Pilot" in train_df.columns:
+        pilot_stats = _compute_pilot_param_stats(
+            train_df,
+            "Mass_Pilot",
+            proc_cols,
+            PILOT_ZSCORE_TOPK,
+        )
+        if pilot_stats is not None:
+            context["pilot_param_stats"] = pilot_stats
+
     width_edges = context.get("width_edges")
     if width_edges is not None and "Plant" in train_df.columns:
         width_bins = _assign_bins(train_df["Width"], width_edges)
@@ -116,17 +254,45 @@ def _process_dataframe(
     if is_train:
         out[config.target_column] = df[config.target_column]
 
+    base_columns = ["Plant", "Mass_Pilot", "Width", "Aspect", "Inch"]
+    for col in base_columns:
+        if col in df.columns:
+            out[col] = df[col]
+
     # Size bins & interactions
+    size_risk_score = pd.Series(0, index=out.index, dtype="float32") if ENABLE_SIZE_RISK else None
+
     for col in ("Width", "Aspect", "Inch"):
         edges = context.get(f"{col.lower()}_edges")
         if edges is not None and col in df.columns:
             out[f"{col}_bin"] = _assign_bins(df[col], edges)
+
+        if ENABLE_SIZE_RISK:
+            risk_info = context.get("size_risk_info", {}).get(col)
+            bin_col = f"{col}_bin"
+            if risk_info and bin_col in out.columns:
+                risk_bins = set(risk_info.get("risk_bins", []))
+                flag = (
+                    out[bin_col]
+                    .fillna(-1)
+                    .astype(int)
+                    .isin(risk_bins)
+                    .astype("int8")
+                )
+                out[f"{col}_risk_flag"] = flag
+                size_risk_score += flag
+
     if {"Plant", "Width"}.issubset(df.columns) and "Width_bin" in out.columns:
         combo = df["Plant"].astype(str) + "_" + out["Width_bin"].astype(str)
         out["plant_width_bin"] = combo.map(hash)
     if {"Mass_Pilot", "Width"}.issubset(df.columns) and "Width_bin" in out.columns:
         combo = df["Mass_Pilot"].astype(str) + "_" + out["Width_bin"].astype(str)
         out["mass_width_bin"] = combo.map(hash)
+        if ENABLE_MASS_SIZE_INTERACTION:
+            out["width_bin_x_pilot"] = pd.Categorical(combo).codes.astype("int32")
+    if ENABLE_MASS_SIZE_INTERACTION and {"Mass_Pilot", "Aspect"}.issubset(df.columns) and "Aspect_bin" in out.columns:
+        combo = df["Mass_Pilot"].astype(str) + "_" + out["Aspect_bin"].astype(str)
+        out["aspect_bin_x_pilot"] = pd.Categorical(combo).codes.astype("int32")
 
     proc_cols = context.get("proc_cols") or [
         col
@@ -143,6 +309,19 @@ def _process_dataframe(
         feats = _tensor_features(df, prefix)
         for col in feats.columns:
             out[col] = feats[col].values
+        if ENABLE_SEQ_GRAD:
+            cols = _prefixed_columns(df, prefix)
+            if cols:
+                matrix = (
+                    df[cols]
+                    .ffill(axis=1)
+                    .bfill(axis=1)
+                    .to_numpy(dtype=np.float32)
+                )
+                gradients = np.diff(matrix, axis=1)
+                out[f"{prefix}_grad_std"] = gradients.std(axis=1)
+                out[f"{prefix}_grad_max"] = gradients.max(axis=1)
+                out[f"{prefix}_grad_min"] = gradients.min(axis=1)
 
     if {"x_range", "y_range"}.issubset(out.columns):
         out["xy_range_ratio"] = out["x_range"] / (out["y_range"] + 1e-6)
@@ -168,6 +347,25 @@ def _process_dataframe(
     if plant_proc_std_mean is not None and "Plant" in df.columns:
         out["plant_proc_std_mean"] = df["Plant"].map(plant_proc_std_mean).fillna(plant_proc_std_mean.mean())
 
+    if ENABLE_PLANT_RISK and "Plant" in df.columns:
+        outlier_map = context.get("plant_outlier_rate_map")
+        if outlier_map is not None:
+            rates = outlier_map.get("rates")
+            overall = outlier_map.get("overall", 0.0)
+            if rates is not None:
+                out["plant_outlier_rate"] = df["Plant"].map(rates).fillna(overall)
+        risk_info = context.get("plant_risk")
+        if risk_info is not None:
+            score_map = risk_info.get("score", {})
+            default_score = risk_info.get("default_score", 0.0)
+            thresholds = risk_info.get("quality_thresholds", [0.33, 0.66])
+            risk_score = df["Plant"].map(score_map).fillna(default_score)
+            out["plant_risk_score"] = risk_score
+            bins = [-np.inf] + thresholds + [np.inf]
+            labels = [0, 1, 2]
+            quality = pd.cut(risk_score, bins=bins, labels=labels)
+            out["plant_quality_group"] = quality.cat.codes.astype("int64")
+
     plant_proc_mean = context.get("plant_proc_mean")
     if isinstance(plant_proc_mean, pd.DataFrame) and not plant_proc_mean.empty and "Plant" in df.columns:
         for col in proc_cols:
@@ -175,11 +373,30 @@ def _process_dataframe(
                 mean_map = plant_proc_mean[col]
                 out[f"{col}_dev_from_plant"] = df[col] - df["Plant"].map(mean_map).fillna(mean_map.mean())
 
+    if ENABLE_PILOT_PARAM_ZSCORE and "Mass_Pilot" in df.columns:
+        pilot_stats = context.get("pilot_param_stats", {})
+        pilot_series = df["Mass_Pilot"].astype(str)
+        for col, stats in pilot_stats.items():
+            if col not in df.columns:
+                continue
+            means = stats.get("mean", {})
+            stds = stats.get("std", {})
+            global_mean = stats.get("global_mean", 0.0)
+            global_std = stats.get("global_std", 1.0)
+            mean_series = pilot_series.map(means).fillna(global_mean)
+            std_series = pilot_series.map(stds).fillna(global_std)
+            std_series = std_series.replace(0, global_std)
+            z = (df[col] - mean_series) / (std_series + 1e-6)
+            out[f"{col}_pilot_zscore"] = z.astype(np.float32)
+
     latent_frames = context.get("latent")
     if latent_frames is not None:
         latent_df = latent_frames["train" if is_train else "test"]
         for col in latent_df.columns:
             out[col] = latent_df.loc[df.index, col].values
+
+    if ENABLE_SIZE_RISK and size_risk_score is not None and size_risk_score.any():
+        out["Size_Risk_Score"] = size_risk_score.astype(int)
 
     return out
 

@@ -268,6 +268,49 @@ def compare_tree_models(config: PipelineConfig | None = None) -> dict[str, dict[
     return results
 
 
+def run_tree_inference(
+    config: PipelineConfig | None = None,
+    model_name: str = "catboost",
+    use_tuned: bool = True,
+) -> None:
+    """트리 모델 추론."""
+    config = config or PipelineConfig()
+    config.ensure_output_dirs()
+    
+    processed_dir = config.output_dir / "processed"
+    predictions_dir = config.output_dir / "predictions"
+    predictions_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 테스트 데이터 로딩
+    test_df = pd.read_pickle(processed_dir / "test_tree_ready.pkl")
+    feature_cols = _get_feature_columns(test_df, config)
+    
+    # 모델 로딩
+    model_dir = config.output_dir / "models"
+    if use_tuned:
+        model_pattern = f"{model_name}_tuned_fold*.joblib"
+    else:
+        model_pattern = f"{model_name}_fold*.joblib"
+    
+    model_paths = sorted(model_dir.glob(model_pattern))
+    if not model_paths:
+        raise FileNotFoundError(f"모델이 존재하지 않습니다: {model_pattern}")
+    
+    logger.info("%s 모델 %d개 로딩", model_name.upper(), len(model_paths))
+    
+    all_probs = []
+    with log_time(logger, f"{model_name.upper()} 추론"):
+        for path in model_paths:
+            model = joblib.load(path)
+            probs = model.predict_proba(test_df[feature_cols])[:, 1]
+            all_probs.append(probs)
+            logger.info("추론 완료: %s", path.name)
+    
+    ensemble_probs = np.mean(np.vstack(all_probs), axis=0).astype(np.float32)
+    save_numpy(predictions_dir / "raw_probs.npy", ensemble_probs)
+    logger.info("평균 확률 저장: %s (shape: %s)", predictions_dir / "raw_probs.npy", ensemble_probs.shape)
+
+
 if __name__ == "__main__":
     import argparse
     

@@ -1,1 +1,1 @@
-{"roc_auc": 0.7681541674924914, "average_precision": 0.4134645287547282, "model": "catboost"}
+{"roc_auc": 0.7183988656980378, "average_precision": 0.4012520119134703, "model": "catboost"}

@@ -1,1 +1,1 @@
-{"roc_auc": 0.7344605204982392, "average_precision": 0.34492003303813307, "model": "lgbm"}
+{"roc_auc": 0.6870531017975028, "average_precision": 0.37515151154264026, "model": "lgbm"}

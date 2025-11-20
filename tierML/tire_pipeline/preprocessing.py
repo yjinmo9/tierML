@@ -226,18 +226,16 @@ def _build_group_folds(
 
 
 def _build_group_keys(df: pd.DataFrame) -> pd.Series:
-    def _bin(series_name: str) -> pd.Series:
-        series = df[series_name] if series_name in df.columns else pd.Series(index=df.index, dtype=float)
-        if series.dropna().empty:
-            return pd.Series(-1, index=df.index)
-        binned = pd.qcut(series, q=5, duplicates="drop", labels=False)
-        return binned.astype("Int64").fillna(-1)
-
-    width_bins = _bin("Width")
-    aspect_bins = _bin("Aspect")
+    """GroupKFold용 그룹 키 생성: Plant + Mass_Pilot 조합.
+    
+    - Class는 타겟 누수 방지를 위해 제외
+    - Width/Aspect/Inch는 continuous 변수라 그룹에 포함하지 않음
+    - Plant + Mass_Pilot만 사용하여 안정적인 fold 분할
+    """
     plant = df.get("Plant", pd.Series("Unknown", index=df.index)).astype(str)
     mass = df.get("Mass_Pilot", pd.Series("Unknown", index=df.index)).astype(str)
-    return plant + "__" + mass + "__W" + width_bins.astype(str) + "__A" + aspect_bins.astype(str)
+    
+    return plant + "__" + mass
 
 
 # -----------------------------------------------------------------------------
@@ -251,9 +249,20 @@ def run_preprocessing(config: PipelineConfig | None = None) -> None:
     processed_dir = config.output_dir / "processed"
 
     with log_time(logger, "전처리 전체 수행"):
-        train_df, test_df = load_train_test(config)
-        train_df = train_df.copy()
-        test_df = test_df.copy()
+        # feature_generation에서 만든 피처 사용 (latent 포함)
+        features_dir = config.output_dir / "features"
+        train_features_path = features_dir / "train_features.pkl"
+        test_features_path = features_dir / "test_features.pkl"
+        
+        if train_features_path.exists() and test_features_path.exists():
+            logger.info("생성된 피처 파일 사용: %s", features_dir)
+            train_df = pd.read_pickle(train_features_path)
+            test_df = pd.read_pickle(test_features_path)
+        else:
+            logger.info("피처 파일이 없어 원본 데이터 사용")
+            train_df, test_df = load_train_test(config)
+            train_df = train_df.copy()
+            test_df = test_df.copy()
 
         target_series = train_df[config.target_column]
         if target_series.dtype.kind in "fc":
