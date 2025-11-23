@@ -39,6 +39,33 @@ def _load_tree_data(config: PipelineConfig) -> tuple[pd.DataFrame, np.ndarray, d
     train_df = pd.read_pickle(processed_dir / "train_tree_ready.pkl")
     y = load_numpy(processed_dir / "train_y.npy")
     metadata = json.loads((processed_dir / "metadata.json").read_text())
+    
+    # feature_generation.py에서 생성한 피처 병합
+    features_dir = config.output_dir / "features"
+    train_features_path = features_dir / "train_features.pkl"
+    if train_features_path.exists():
+        train_features = pd.read_pickle(train_features_path)
+        # train_tree_ready에 이미 있는 피처는 제외 (중복 방지)
+        existing_cols = set(train_df.columns)
+        new_cols = [col for col in train_features.columns if col not in existing_cols]
+        if new_cols:
+            # 인덱스로 병합 (인덱스가 같은 경우)
+            if len(train_df) == len(train_features) and train_df.index.equals(train_features.index):
+                train_df = train_df.join(train_features[new_cols], how="left")
+                logger.info("생성된 피처 %d개 병합 완료 (인덱스 기준)", len(new_cols))
+            else:
+                # ID 컬럼으로 병합 시도
+                id_col = config.id_column
+                if id_col in train_df.columns and id_col in train_features.columns:
+                    train_df = train_df.merge(
+                        train_features[[id_col] + new_cols],
+                        on=id_col,
+                        how="left"
+                    )
+                    logger.info("생성된 피처 %d개 병합 완료 (ID 컬럼 기준)", len(new_cols))
+                else:
+                    logger.warning("피처 병합 실패: 인덱스나 ID 컬럼이 일치하지 않음")
+    
     return train_df, y, metadata
 
 
@@ -164,19 +191,61 @@ def _train_catboost_fold(
         if X[col].dtype in ["object", "category", "int64"] and X[col].nunique() < 100
     ]
     
-    model = cb.CatBoostClassifier(
-        iterations=500,
-        depth=7,
-        learning_rate=0.05,
-        min_data_in_leaf=20,
-        subsample=0.8,
-        colsample_bylevel=0.8,
-        scale_pos_weight=pos_weight,
-        random_seed=config.random_seed + fold,
-        cat_features=cat_features if cat_features else None,
-        verbose=False,
-        early_stopping_rounds=50,
-    )
+    # 튜닝된 파라미터 로드 시도
+    tuned_params_path = config.output_dir / "logs" / "train_metrics_catboost_tuned.jsonl"
+    if tuned_params_path.exists():
+        try:
+            tuned_metrics = json.loads(tuned_params_path.read_text())
+            best_params = tuned_metrics.get("params", {})
+            # 튜닝된 파라미터 사용
+            model = cb.CatBoostClassifier(
+                iterations=best_params.get("iterations", 318),
+                depth=best_params.get("depth", 9),
+                learning_rate=best_params.get("learning_rate", 0.015),
+                min_data_in_leaf=best_params.get("min_data_in_leaf", 30),
+                subsample=best_params.get("subsample", 0.83),
+                colsample_bylevel=best_params.get("colsample_bylevel", 0.63),
+                scale_pos_weight=pos_weight,
+                random_seed=config.random_seed + fold,
+                cat_features=cat_features if cat_features else None,
+                verbose=False,
+                early_stopping_rounds=50,
+            )
+            logger.info("튜닝된 파라미터 사용: iterations=%d, depth=%d, lr=%.4f", 
+                       best_params.get("iterations", 318),
+                       best_params.get("depth", 9),
+                       best_params.get("learning_rate", 0.015))
+        except Exception as e:
+            logger.warning("튜닝된 파라미터 로드 실패, 기본 파라미터 사용: %s", e)
+            model = cb.CatBoostClassifier(
+                iterations=500,
+                depth=7,
+                learning_rate=0.05,
+                min_data_in_leaf=20,
+                subsample=0.8,
+                colsample_bylevel=0.8,
+                scale_pos_weight=pos_weight,
+                random_seed=config.random_seed + fold,
+                cat_features=cat_features if cat_features else None,
+                verbose=False,
+                early_stopping_rounds=50,
+            )
+    else:
+        # 기본 파라미터 사용
+        model = cb.CatBoostClassifier(
+            iterations=500,
+            depth=7,
+            learning_rate=0.05,
+            min_data_in_leaf=20,
+            subsample=0.8,
+            colsample_bylevel=0.8,
+            scale_pos_weight=pos_weight,
+            random_seed=config.random_seed + fold,
+            cat_features=cat_features if cat_features else None,
+            verbose=False,
+            early_stopping_rounds=50,
+        )
+    
     model.fit(
         X_train, y_train,
         eval_set=(X_valid, y_valid),
@@ -283,6 +352,33 @@ def run_tree_inference(
     
     # 테스트 데이터 로딩
     test_df = pd.read_pickle(processed_dir / "test_tree_ready.pkl")
+    
+    # feature_generation.py에서 생성한 피처 병합
+    features_dir = config.output_dir / "features"
+    test_features_path = features_dir / "test_features.pkl"
+    if test_features_path.exists():
+        test_features = pd.read_pickle(test_features_path)
+        # train_tree_ready에 이미 있는 피처는 제외 (중복 방지)
+        existing_cols = set(test_df.columns)
+        new_cols = [col for col in test_features.columns if col not in existing_cols]
+        if new_cols:
+            # 인덱스로 병합 (인덱스가 같은 경우)
+            if len(test_df) == len(test_features) and test_df.index.equals(test_features.index):
+                test_df = test_df.join(test_features[new_cols], how="left")
+                logger.info("생성된 테스트 피처 %d개 병합 완료 (인덱스 기준)", len(new_cols))
+            else:
+                # ID 컬럼으로 병합 시도
+                id_col = config.id_column
+                if id_col in test_df.columns and id_col in test_features.columns:
+                    test_df = test_df.merge(
+                        test_features[[id_col] + new_cols],
+                        on=id_col,
+                        how="left"
+                    )
+                    logger.info("생성된 테스트 피처 %d개 병합 완료 (ID 컬럼 기준)", len(new_cols))
+                else:
+                    logger.warning("테스트 피처 병합 실패: 인덱스나 ID 컬럼이 일치하지 않음")
+    
     feature_cols = _get_feature_columns(test_df, config)
     
     # 모델 로딩

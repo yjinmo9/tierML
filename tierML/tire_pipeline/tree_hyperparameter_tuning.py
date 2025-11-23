@@ -38,6 +38,33 @@ def _load_tree_data(config: PipelineConfig) -> tuple[pd.DataFrame, np.ndarray, d
     train_df = pd.read_pickle(processed_dir / "train_tree_ready.pkl")
     y = load_numpy(processed_dir / "train_y.npy")
     metadata = json.loads((processed_dir / "metadata.json").read_text())
+    
+    # feature_generation.py에서 생성한 피처 병합
+    features_dir = config.output_dir / "features"
+    train_features_path = features_dir / "train_features.pkl"
+    if train_features_path.exists():
+        train_features = pd.read_pickle(train_features_path)
+        # train_tree_ready에 이미 있는 피처는 제외 (중복 방지)
+        existing_cols = set(train_df.columns)
+        new_cols = [col for col in train_features.columns if col not in existing_cols]
+        if new_cols:
+            # 인덱스로 병합 (인덱스가 같은 경우)
+            if len(train_df) == len(train_features) and train_df.index.equals(train_features.index):
+                train_df = train_df.join(train_features[new_cols], how="left")
+                logger.info("생성된 피처 %d개 병합 완료 (인덱스 기준)", len(new_cols))
+            else:
+                # ID 컬럼으로 병합 시도
+                id_col = config.id_column
+                if id_col in train_df.columns and id_col in train_features.columns:
+                    train_df = train_df.merge(
+                        train_features[[id_col] + new_cols],
+                        on=id_col,
+                        how="left"
+                    )
+                    logger.info("생성된 피처 %d개 병합 완료 (ID 컬럼 기준)", len(new_cols))
+                else:
+                    logger.warning("피처 병합 실패: 인덱스나 ID 컬럼이 일치하지 않음")
+    
     return train_df, y, metadata
 
 
